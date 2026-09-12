@@ -16,7 +16,6 @@ const long DEFAULT_STEP_COUNT = 10000;
 const int DEFAULT_STEP_DELAY_US = 125;
 const int STANDBY_WAKE_DELAY_MS = 5;
 
-// Izolovaný stav pre každý motor
 struct MotorState {
   bool active = false;
   int direction = -1;
