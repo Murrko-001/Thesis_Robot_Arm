@@ -136,6 +136,22 @@ class CommandTests(unittest.TestCase):
 
 
 class ProductionTests(unittest.TestCase):
+    def test_disabled_middle_phase_sends_final_targets_and_waits_for_completion(self):
+        for selected in (*config.ARMS_MAPPING, config.LOWER_ALL):
+            with self.subTest(selected=selected):
+                boards = {index: SimulatedBoard(index, []) for index in (1, 2)}
+                with patch.object(config, "MOVE_THROUGH_MIDDLE", False), patch.object(
+                    board_connection.time, "sleep",
+                ):
+                    orchestrator.select_arm(boards, selected)
+                for arm, mapping in config.ARMS_MAPPING.items():
+                    board = boards[mapping["board_id"]]
+                    self.assertEqual(len(board.payloads), 1)
+                    targets = [group["position"] for group in board.payloads[0]["commands"]
+                               if mapping["motor"] in group["motors"]]
+                    self.assertEqual(targets, [45000 if arm == selected else 0])
+                    self.assertEqual(board.chunks, [])
+
     def test_both_production_phases_use_configured_default_delay(self):
         boards = {index: SimulatedBoard(index, []) for index in (1, 2)}
         with patch.object(config, "DEFAULT_STEP_DELAY_US", 250), patch.object(

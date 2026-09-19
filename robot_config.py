@@ -24,6 +24,8 @@ DEFAULT_STEP_DELAY_US = 125
 MIN_STEP_DELAY_US = 1
 MAX_STEP_DELAY_US = 32_767
 LOWER_ALL = 9
+# False sends final targets directly, including when lowering all arms.
+MOVE_THROUGH_MIDDLE = True
 
 SERIAL_TIMEOUT_SECONDS = 0.5
 BOARD_STARTUP_SECONDS = 2

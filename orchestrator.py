@@ -51,7 +51,7 @@ def show_controls(debug: bool) -> None:
         print("Press Enter to read responses.")
     else:
         arms = ", ".join(map(str, sorted(config.ARMS_MAPPING)))
-        print(f"Select arm {arms}, or {config.LOWER_ALL} to lower all. Each move passes through the middle.")
+        print(f"Select arm {arms}, or {config.LOWER_ALL} to lower all.")
 
 
 def run_interactive(boards: BoardConnections, *, debug: bool = False) -> None:

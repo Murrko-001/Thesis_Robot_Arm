@@ -72,16 +72,17 @@ def build_board_payloads(payload: JsonPayload) -> Dict[int, JsonPayload]:
 
 
 def selection_phases(arm: int) -> List[JsonPayload]:
-    """All arms reach the middle before the selected arm rises and the rest lower."""
+    """Build final targets, optionally preceded by a shared middle-position phase."""
     if type(arm) is not int or (arm not in config.ARMS_MAPPING and arm != config.LOWER_ALL):
         raise ValueError(
             f"Choose an arm from {sorted(config.ARMS_MAPPING)}, or {config.LOWER_ALL} to lower all."
         )
     arms = sorted(config.ARMS_MAPPING)
-    return [
-        {"commands": [{"arms": arms, "position": config.MIDDLE_POSITION}]},
-        {"commands": [
-            {"arms": [index], "position": config.TOP_POSITION if index == arm else config.BOTTOM_POSITION}
-            for index in arms
-        ]},
-    ]
+    phases = []
+    if config.MOVE_THROUGH_MIDDLE:
+        phases.append({"commands": [{"arms": arms, "position": config.MIDDLE_POSITION}]})
+    phases.append({"commands": [
+        {"arms": [index], "position": config.TOP_POSITION if index == arm else config.BOTTOM_POSITION}
+        for index in arms
+    ]})
+    return phases
