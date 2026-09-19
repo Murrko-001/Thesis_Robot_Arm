@@ -2,3 +2,15 @@ todo:
 - add some kind of calibration for each arm
     (ideally in a way that wouldn't require to reboot the boards, so somehow in the orchestrator)
 - wooden platform for the speakers
+
+(base) school@MacBook-Pro-uzivatela-Martin-2 Thesis_Robot_Arm % /usr/local/bin/python3 /Users/school/Documents/UPJS/Diplomka/Thesis_Robot_Arm/orchestrator.py
+Connecting to Board 1 on /dev/cu.usbmodem101...
+Connecting to Board 2 on /dev/cu.usbmodem11301...
+All motors must start at the bottom when the boards boot.
+Choose an arm from [1, 2, 3, 4], or 9 to lower all.
+Every selection moves all arms through the middle first.
+Type 'exit' or 'quit' to close.
+Arm >>> 1
+Moving all arms to the middle...
+Error: Board 1: No valid instructions.
+(base) school@MacBook-Pro-uzivatela-Martin-2 Thesis_Robot_Arm % 
