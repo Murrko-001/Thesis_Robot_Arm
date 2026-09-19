@@ -1,27 +1,28 @@
-import serial
-import time
-import sys
-import json
-from typing import Dict, Any, List, Optional
+"""Convert normalized arm positions (0–1) to absolute steps for the boards."""
 
-# Type aliases for enhanced readability
+import argparse
+import json
+import time
+from typing import Any, Dict, List, Optional, Set
+
+import serial
+
 BoardConnections = Dict[int, serial.Serial]
 JsonPayload = Dict[str, Any]
 
-# Available serial ports mapping
-PORTS: Dict[int, str] = {
-    1: '/dev/cu.usbmodem101',
-    2: '/dev/cu.usbmodem11301',
-    3: 'COM6'
+PORTS = {
+    1: "/dev/cu.usbmodem101",
+    2: "/dev/cu.usbmodem11301",
+    3: "COM6",
 }
-BAUD_RATE: int = 115_200
+BAUD_RATE = 115_200
+STEPS_TO_TOP = 45_000
+MAX_STEP_DELAY_US = 32_767
+MOVE_TIMEOUT_SECONDS = 30
+LOWER_ALL = 9
 
-# Constants (Fixed: 45000 instead of tuple 45,000)
-TOP_POSITION: int = 45_000
-MID_POSITION: int = int(TOP_POSITION / 2)
-
-# Logical arm ID -> Physical Board ID & Motor ID mapping
-ARMS_MAPPING: Dict[int, Dict[str, int]] = {
+# Logical arm ID -> physical board and motor.
+ARMS_MAPPING = {
     1: {"board_id": 1, "motor": 1},
     2: {"board_id": 1, "motor": 3},
     3: {"board_id": 2, "motor": 2},
@@ -30,196 +31,246 @@ ARMS_MAPPING: Dict[int, Dict[str, int]] = {
 
 
 def connect_to_single_board(board_id: int, port: str) -> serial.Serial:
-    """
-    Establishes a serial connection to a single board.
-    """
-    print(f"Connecting to Board {board_id} on port {port}...")
+    print(f"Connecting to Board {board_id} on {port}...")
+    return serial.Serial(port, BAUD_RATE, timeout=0.5)
+
+
+def connect_to_active_boards(
+    use_board_1: bool = False,
+    use_board_2: bool = False,
+    use_board_3: bool = False,
+) -> BoardConnections:
+    boards: BoardConnections = {}
     try:
-        board_connection = serial.Serial(port, BAUD_RATE, timeout=0.5)
-        return board_connection
-    except Exception as error:
-        print(f"Error connecting to Board {board_id}: {error}")
-        print("Make sure your Arduino IDE Serial Monitor is CLOSED.")
-        sys.exit(1)
+        for board_id, enabled in enumerate((use_board_1, use_board_2, use_board_3), 1):
+            if enabled:
+                boards[board_id] = connect_to_single_board(board_id, PORTS[board_id])
+        if not boards:
+            raise ValueError("No boards enabled.")
+
+        time.sleep(2)
+        for connection in boards.values():
+            connection.reset_input_buffer()
+    except (serial.SerialException, OSError, ValueError, KeyboardInterrupt):
+        close_all_connections(boards)
+        raise
+    return boards
 
 
-def connect_to_active_boards(use_board_1: bool = False, use_board_2: bool = False, use_board_3: bool = False) -> BoardConnections:
-    """
-    Connects to all enabled boards based on boolean flags.
-    """
-    active_boards: BoardConnections = {}
-    flags: Dict[int, bool] = {1: use_board_1, 2: use_board_2, 3: use_board_3}
+def validate_command(command: Any) -> List[int]:
+    """Validate a group and return its logical arm IDs (including the motors alias)."""
+    if not isinstance(command, dict):
+        raise ValueError("Each command must be an object.")
+    if "step_count" in command or "direction" in command:
+        raise ValueError("Use position instead of step_count and direction.")
 
-    print("--- Board Initialization ---")
-    for board_id, should_use in flags.items():
-        if not should_use:
-            print(f"Board {board_id} is disabled. Skipping.")
-            continue
-            
-        port: str = PORTS[board_id]
-        board_connection = connect_to_single_board(board_id, port)
-        active_boards[board_id] = board_connection
+    position = command.get("position")
+    if type(position) not in (int, float) or not 0 <= position <= 1:
+        raise ValueError("Position must be a number from 0 (bottom) to 1 (top).")
+    if "step_delay" in command:
+        delay = command["step_delay"]
+        if type(delay) is not int or not 1 <= delay <= MAX_STEP_DELAY_US:
+            raise ValueError(f"Step delay must be an integer from 1 to {MAX_STEP_DELAY_US} microseconds.")
 
-    if not active_boards:
-        print("No boards were initialized. Exiting program.")
-        sys.exit(1)
-
-    print("Waiting 2 seconds for boards to initialize...")
-    time.sleep(2)
-    
-    for board_connection in active_boards.values():
-        board_connection.reset_input_buffer()
-
-    print(f"Successfully connected to {len(active_boards)} board(s).\n")
-    return active_boards
+    if "arms" in command and "motors" in command:
+        raise ValueError("Specify arms or motors, not both; both refer to logical arm IDs.")
+    arms = command.get("arms", command.get("motors"))
+    if not isinstance(arms, list) or not arms:
+        raise ValueError("Expected a non-empty arms array (or motors alias).")
+    if any(type(arm) is not int or arm not in ARMS_MAPPING for arm in arms):
+        raise ValueError(f"Arm IDs must be integers from {sorted(ARMS_MAPPING)}.")
+    return arms
 
 
 def build_board_payloads(command_payload: JsonPayload) -> Dict[int, JsonPayload]:
-    """
-    Parses global command payload and routes instructions to specific board payloads 
-    based on ARMS_MAPPING. Accepts either 'arms' or 'motors' in the JSON command.
-    """
-    raw_commands: List[Dict[str, Any]] = command_payload.get("commands", [])
-    if not raw_commands:
-        return {}
+    """Validate normalized targets, round to whole steps, and route in group order."""
+    if not isinstance(command_payload, dict):
+        raise ValueError("Expected a JSON object.")
+    commands = command_payload.get("commands")
+    if not isinstance(commands, list) or not commands:
+        raise ValueError("Expected a non-empty commands array.")
 
-    # Dictionary holding per-board structured commands: {board_id: {"commands": [...]}}
-    board_payloads: Dict[int, JsonPayload] = {}
-
-    for cmd in raw_commands:
-        # Support both 'arms' and 'motors' key in input JSON
-        target_arms: List[int] = cmd.get("arms") or cmd.get("motors", [])
-        
-        # Group target physical motor IDs by board_id for this specific command group
+    payloads: Dict[int, JsonPayload] = {}
+    for command in commands:
+        arms = validate_command(command)
+        position_steps = round(command["position"] * STEPS_TO_TOP)
         motors_by_board: Dict[int, List[int]] = {}
+        for arm in arms:
+            mapping = ARMS_MAPPING[arm]
+            motors_by_board.setdefault(mapping["board_id"], []).append(mapping["motor"])
 
-        for arm_id in target_arms:
-            if arm_id in ARMS_MAPPING:
-                mapped_board: int = ARMS_MAPPING[arm_id]["board_id"]
-                mapped_motor: int = ARMS_MAPPING[arm_id]["motor"]
-                
-                if mapped_board not in motors_by_board:
-                    motors_by_board[mapped_board] = []
-                motors_by_board[mapped_board].append(mapped_motor)
-            else:
-                print(f"Warning: Arm/Motor ID {arm_id} not found in ARMS_MAPPING.")
-
-        # Construct individual command group for each target board
-        for board_id, physical_motors in motors_by_board.items():
-            board_cmd: Dict[str, Any] = cmd.copy()
-            
-            # Clean up keys and assign converted physical motor list
-            board_cmd.pop("arms", None)
-            board_cmd["motors"] = physical_motors
-
-            if board_id not in board_payloads:
-                board_payloads[board_id] = {"commands": []}
-            
-            board_payloads[board_id]["commands"].append(board_cmd)
-
-    return board_payloads
+        for board_id, motors in motors_by_board.items():
+            group = {"motors": motors, "position": position_steps}
+            if "step_delay" in command:
+                group["step_delay"] = command["step_delay"]
+            payloads.setdefault(board_id, {"commands": []})["commands"].append(group)
+    return payloads
 
 
-def send_json_command_to_mapped_boards(boards: BoardConnections, command_payload: JsonPayload) -> None:
-    """
-    Translates input JSON via ARMS_MAPPING and sends targeted payloads 
-    ONLY to the necessary active boards.
-    """
-    board_payloads: Dict[int, JsonPayload] = build_board_payloads(command_payload)
+def send_json_command_to_mapped_boards(
+    boards: BoardConnections,
+    command_payload: JsonPayload,
+    *,
+    wait: bool = False,
+    verbose: bool = True,
+) -> None:
+    payloads = build_board_payloads(command_payload)
+    missing = sorted(set(payloads) - set(boards))
+    if missing:
+        raise ValueError(f"Target boards are not connected: {missing}.")
 
-    if not board_payloads:
-        print("No valid board targets found in command payload.")
-        return
+    if wait:
+        # Production waits after every phase, so no previous move is in flight.
+        for board_id in payloads:
+            boards[board_id].reset_input_buffer()
 
-    for board_id, board_payload in board_payloads.items():
-        if board_id not in boards:
-            print(f"Warning: Command target Board {board_id} is needed but NOT connected!")
-            continue
+    for board_id, payload in payloads.items():
+        message = json.dumps(payload, separators=(",", ":"))
+        boards[board_id].write((message + "\n").encode("utf-8"))
+        if verbose:
+            print(f"[Sent to Board {board_id}]: {message}")
 
-        try:
-            json_string: str = json.dumps(board_payload) + "\n"
-            command_bytes: bytes = json_string.encode('utf-8')
+    if wait:
+        wait_for_boards(boards, set(payloads))
 
-            # Send payload specifically to this board
-            boards[board_id].write(command_bytes)
-            print(f"[Sent to Board {board_id}]: {json_string.strip()}")
-            
-        except Exception as error:
-            print(f"Error sending command to Board {board_id}: {error}")
+
+def wait_for_boards(
+    boards: BoardConnections,
+    board_ids: Set[int],
+    timeout_seconds: float = MOVE_TIMEOUT_SECONDS,
+) -> None:
+    """Wait for executing/completed from every board, retaining partial serial lines."""
+    pending = set(board_ids)
+    started: Set[int] = set()
+    buffers = {board_id: b"" for board_id in pending}
+    deadline = time.monotonic() + timeout_seconds
+    while pending:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for boards {sorted(pending)}; transition stopped.")
+        for board_id in sorted(pending):
+            connection = boards[board_id]
+            available = connection.in_waiting
+            if not available:
+                continue
+            buffers[board_id] += connection.read(available)
+            while b"\n" in buffers[board_id]:
+                line, buffers[board_id] = buffers[board_id].split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    response = json.loads(line)
+                except (ValueError, UnicodeError) as error:
+                    raise RuntimeError(f"Board {board_id} returned an invalid response.") from error
+                if not isinstance(response, dict):
+                    raise RuntimeError(f"Board {board_id} returned an invalid response.")
+                status = response.get("status")
+                if status == "error":
+                    raise RuntimeError(f"Board {board_id}: {response.get('message', 'Movement failed.')}")
+                if status == "board_ready":
+                    raise RuntimeError(f"Board {board_id} restarted; position tracking was reset.")
+                if status == "executing":
+                    started.add(board_id)
+                elif status == "completed" and board_id in started:
+                    pending.remove(board_id)
+                    break
+        if pending:
+            time.sleep(0.01)
+
+
+def select_arm(boards: BoardConnections, arm: int) -> None:
+    """Move every arm to the middle, then raise the selection and lower the rest."""
+    if type(arm) is not int or (arm not in ARMS_MAPPING and arm != LOWER_ALL):
+        raise ValueError(f"Choose an arm from {sorted(ARMS_MAPPING)}, or 9 to lower all.")
+
+    print("Moving all arms to the middle...")
+    send_json_command_to_mapped_boards(boards, {
+        "commands": [{"arms": sorted(ARMS_MAPPING), "position": 0.5}],
+    }, wait=True, verbose=False)
+
+    print("Moving to final positions...")
+    send_json_command_to_mapped_boards(boards, {
+        "commands": [
+            {"arms": [index], "position": 1 if index == arm else 0}
+            for index in sorted(ARMS_MAPPING)
+        ],
+    }, wait=True, verbose=False)
+    print("All arms are down." if arm == LOWER_ALL else f"Arm {arm} is up; all others are down.")
 
 
 def read_and_print_responses(boards: BoardConnections, wait_time_seconds: float = 0.1) -> None:
-    """
-    Reads and displays incoming responses from all active boards.
-    """
     time.sleep(wait_time_seconds)
-
-    for board_id, board_connection in boards.items():
-        while board_connection.in_waiting > 0:
-            try:
-                response_bytes: bytes = board_connection.readline()
-                response_string: str = response_bytes.decode('utf-8').strip()
-                
-                if response_string:
-                    print(f"[Board {board_id} - {PORTS[board_id]}]: {response_string}")
-            except Exception as error:
-                print(f"[Board {board_id}] Error while reading: {error}")
+    for board_id, connection in boards.items():
+        while connection.in_waiting:
+            response = connection.readline().decode("utf-8", errors="replace").strip()
+            if response:
+                print(f"[Board {board_id}]: {response}")
 
 
 def parse_user_input(user_input: str) -> Optional[JsonPayload]:
-    """
-    Parses user text string into a valid JSON object.
-    """
     try:
-        parsed_data: JsonPayload = json.loads(user_input)
-        return parsed_data
-    except json.JSONDecodeError as error:
-        print(f"Error: Invalid JSON format. (Detail: {error})")
+        payload = json.loads(user_input)
+        if not isinstance(payload, dict):
+            raise ValueError("Expected a JSON object.")
+        return payload
+    except ValueError as error:
+        print(f"Error: {error}")
         return None
 
 
 def close_all_connections(boards: BoardConnections) -> None:
-    """
-    Safely closes serial connections for all active boards.
-    """
-    print("\nClosing all connections...")
-    for board_connection in boards.values():
-        if board_connection.is_open:
-            board_connection.close()
-    print("All connections successfully closed.")
+    for board_id, connection in boards.items():
+        try:
+            connection.close()
+        except (serial.SerialException, OSError) as error:
+            print(f"Error closing Board {board_id}: {error}")
 
 
 def main() -> None:
-    active_boards: BoardConnections = connect_to_active_boards(
-        use_board_1=True, 
-        use_board_2=True, 
-        use_board_3=False
-    )
+    parser = argparse.ArgumentParser(description="Select an arm to raise, or 9 to lower all arms.")
+    parser.add_argument("--debug", action="store_true", help="Accept normalized JSON movement commands.")
+    args = parser.parse_args()
+    boards: BoardConnections = {}
+    try:
+        boards = connect_to_active_boards(use_board_1=True, use_board_2=True)
+        print("All motors must start at the bottom when the boards boot.")
+        if args.debug:
+            print("Debug mode: positions use 0 = bottom, 0.5 = middle, 1 = top.")
+            print('Example: {"commands": [{"arms": [1, 4], "position": 0.5, "step_delay": 125}]}')
+            print("Press Enter to read board responses.")
+        else:
+            print(f"Choose an arm from {sorted(ARMS_MAPPING)}, or 9 to lower all.")
+            print("Every selection moves all arms through the middle first.")
+        print("Type 'exit' or 'quit' to close.")
 
-    print("--- INTERACTIVE MULTI-BOARD CONTROLLER (MAPPED VERSION) ---")
-    print("Type your JSON command using arm IDs (1 to 4) and press Enter.")
-    print('Example: {"commands": [{"arms": [1, 4], "direction": "UP", "step_count": 5000, "step_delay": 125}]}')
-    print("Type 'exit' or 'quit' to close.\n")
-
-    while True:
-        user_input: str = input("Enter JSON command >>> ").strip()
-
-        if user_input.lower() in ['exit', 'quit']:
-            close_all_connections(active_boards)
-            break
-
-        if not user_input:
-            read_and_print_responses(active_boards, wait_time_seconds=0)
-            continue
-
-        command_payload: Optional[JsonPayload] = parse_user_input(user_input)
-        
-        if command_payload is not None:
-            # Route and send command payloads only to target boards
-            send_json_command_to_mapped_boards(active_boards, command_payload)
-            
-            # Read ACK responses from boards
-            read_and_print_responses(active_boards, wait_time_seconds=0.1)
+        while True:
+            user_input = input("JSON >>> " if args.debug else "Arm >>> ").strip()
+            if user_input.lower() in ("exit", "quit"):
+                break
+            if not user_input:
+                if args.debug:
+                    read_and_print_responses(boards, wait_time_seconds=0)
+                continue
+            if not args.debug:
+                try:
+                    arm = int(user_input)
+                    select_arm(boards, arm)
+                except ValueError as error:
+                    print(f"Error: {error}")
+                continue
+            payload = parse_user_input(user_input)
+            if payload is not None:
+                try:
+                    send_json_command_to_mapped_boards(boards, payload)
+                except ValueError as error:
+                    print(f"Error: {error}")
+                    continue
+                read_and_print_responses(boards)
+    except (EOFError, KeyboardInterrupt):
+        print()
+    except (serial.SerialException, OSError, ValueError, RuntimeError) as error:
+        print(f"Error: {error}")
+    finally:
+        close_all_connections(boards)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,4 @@
 todo:
-- update orchestrator to work with the new json format
 - add some kind of calibration for each arm
     (ideally in a way that wouldn't require to reboot the boards, so somehow in the orchestrator)
 - wooden platform for the speakers
