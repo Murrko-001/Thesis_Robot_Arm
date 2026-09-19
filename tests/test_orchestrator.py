@@ -3,6 +3,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 import orchestrator
+import board_connection
+import motor_commands
+import robot_config as config
 
 
 class SimulatedBoard:
@@ -36,14 +39,14 @@ class SimulatedBoard:
 
 class CommandTests(unittest.TestCase):
     def test_routes_absolute_positions_and_preserves_group_order(self):
-        payloads = orchestrator.build_board_payloads({"commands": [
+        payloads = motor_commands.build_board_payloads({"commands": [
             {"arms": [1, 2, 3, 4], "position": 1, "step_delay": 125},
             {"arms": [1], "position": 0},
         ]})
         self.assertEqual(payloads, {
             1: {"commands": [
                 {"motors": [1, 3], "position": 45000, "step_delay": 125},
-                {"motors": [1], "position": 0},
+                {"motors": [1], "position": 0, "step_delay": 125},
             ]},
             2: {"commands": [
                 {"motors": [2, 3], "position": 45000, "step_delay": 125},
@@ -51,9 +54,9 @@ class CommandTests(unittest.TestCase):
         })
 
     def test_motors_alias_uses_logical_arm_ids(self):
-        self.assertEqual(orchestrator.build_board_payloads({"commands": [
+        self.assertEqual(motor_commands.build_board_payloads({"commands": [
             {"motors": [4], "position": 0.5},
-        ]}), {2: {"commands": [{"motors": [3], "position": 22500}]}})
+        ]}), {2: {"commands": [{"motors": [3], "position": 22500, "step_delay": 125}]}})
 
     def test_invalid_requests_never_write_to_boards(self):
         valid = {"arms": [1], "position": 0.5}
@@ -75,13 +78,13 @@ class CommandTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 board = Mock()
                 with self.assertRaises(ValueError):
-                    orchestrator.send_json_command_to_mapped_boards({1: board}, payload)
+                    board_connection.send_command({1: board}, payload)
                 board.write.assert_not_called()
 
     def test_missing_board_prevents_all_writes(self):
         board = Mock()
         with self.assertRaises(ValueError):
-            orchestrator.send_json_command_to_mapped_boards({1: board}, {
+            board_connection.send_command({1: board}, {
                 "commands": [{"arms": [1, 4], "position": 1}],
             })
         board.write.assert_not_called()
@@ -91,13 +94,13 @@ class CommandTests(unittest.TestCase):
         payload = {"commands": [{"arms": [2], "position": 0.5}]}
         with patch("builtins.print"):
             for _ in range(2):
-                orchestrator.send_json_command_to_mapped_boards({1: board}, payload)
+                board_connection.send_command({1: board}, payload)
         self.assertEqual(board.write.call_count, 2)
         for call in board.write.call_args_list:
             message = call.args[0]
             self.assertTrue(message.endswith(b"\n"))
             self.assertEqual(json.loads(message), {
-                "commands": [{"motors": [3], "position": 22500}],
+                "commands": [{"motors": [3], "position": 22500, "step_delay": 125}],
             })
 
     def test_normalized_positions_convert_to_nearest_step(self):
@@ -108,31 +111,60 @@ class CommandTests(unittest.TestCase):
         ):
             with self.subTest(position=position):
                 payload = {"commands": [{"arms": [1], "position": position}]}
-                result = orchestrator.build_board_payloads(payload)
+                result = motor_commands.build_board_payloads(payload)
                 actual = result[1]["commands"][0]["position"]
                 self.assertEqual(actual, expected)
                 self.assertIs(type(actual), int)
                 self.assertEqual(payload["commands"][0]["position"], position)
 
+    def test_configured_delay_is_sent_unless_command_overrides_it(self):
+        with patch.object(config, "DEFAULT_STEP_DELAY_US", 250):
+            result = motor_commands.build_board_payloads({"commands": [
+                {"arms": [1], "position": 0.5},
+                {"arms": [2], "position": 1, "step_delay": 500},
+            ]})
+        self.assertEqual([group["step_delay"] for group in result[1]["commands"]], [250, 500])
+
     def test_partial_connection_failure_closes_open_boards(self):
         board = Mock()
-        with patch.object(orchestrator, "connect_to_single_board", side_effect=[
+        with patch.object(board_connection.serial, "Serial", side_effect=[
             board, orchestrator.serial.SerialException("unavailable"),
         ]):
             with self.assertRaises(orchestrator.serial.SerialException):
-                orchestrator.connect_to_active_boards(True, True)
+                board_connection.connect_boards((1, 2))
         board.close.assert_called_once()
 
 
 class ProductionTests(unittest.TestCase):
+    def test_both_production_phases_use_configured_default_delay(self):
+        boards = {index: SimulatedBoard(index, []) for index in (1, 2)}
+        with patch.object(config, "DEFAULT_STEP_DELAY_US", 250), patch.object(
+            board_connection.time, "sleep",
+        ):
+            orchestrator.select_arm(boards, 1)
+        for board in boards.values():
+            for phase in board.payloads:
+                for group in phase["commands"]:
+                    self.assertEqual(group["step_delay"], 250)
+
+    def test_debug_reader_preserves_partial_responses_between_inputs(self):
+        board = SimulatedBoard(1, [])
+        reader = board_connection.ResponseReader()
+        board.chunks = [b'{"status":"com']
+        self.assertEqual(list(board_connection.debug_responses({1: board}, reader)), [])
+        board.chunks = [b'pleted"}\n']
+        self.assertEqual(list(board_connection.debug_responses({1: board}, reader)), [
+            (1, '{"status":"completed"}'),
+        ])
+
     def test_every_selection_waits_at_middle_then_sets_only_selected_arm_high(self):
-        for selected in (*orchestrator.ARMS_MAPPING, 9):
+        for selected in (*config.ARMS_MAPPING, 9):
             with self.subTest(selected=selected):
                 events = []
                 boards = {index: SimulatedBoard(index, events) for index in (1, 2)}
-                with patch("builtins.print"), patch.object(orchestrator.time, "sleep"):
+                with patch("builtins.print"), patch.object(board_connection.time, "sleep"):
                     orchestrator.select_arm(boards, selected)
-                for arm, mapping in orchestrator.ARMS_MAPPING.items():
+                for arm, mapping in config.ARMS_MAPPING.items():
                     phases = boards[mapping["board_id"]].payloads
                     self.assertEqual(len(phases), 2)
                     for phase, expected in ((0, 22500), (1, 45000 if arm == selected else 0)):
@@ -172,14 +204,14 @@ class ProductionTests(unittest.TestCase):
             b'{"status":"completed"}\n',
             b'{"status":"exec', b'uting"}\n{"status":"com', b'pleted"}\n',
         ]
-        with patch.object(orchestrator.time, "sleep"):
-            orchestrator.wait_for_boards({1: board}, {1})
+        with patch.object(board_connection.time, "sleep"):
+            board_connection.wait_for_boards({1: board}, {1})
         self.assertEqual(board.chunks, [])
 
     def test_timeout_prevents_final_phase(self):
         boards = {index: SimulatedBoard(index, [], []) for index in (1, 2)}
         with patch("builtins.print"), patch.object(
-            orchestrator.time, "monotonic", side_effect=[0, 31],
+            board_connection.time, "monotonic", side_effect=[0, 31],
         ), self.assertRaises(TimeoutError):
             orchestrator.select_arm(boards, 1)
         for board in boards.values():
@@ -190,9 +222,9 @@ class ProductionTests(unittest.TestCase):
         with patch("sys.argv", ["orchestrator.py", "--debug"]), patch(
             "builtins.input", side_effect=[json.dumps(payload), "quit"],
         ), patch("builtins.print"), patch.object(
-            orchestrator, "connect_to_active_boards", return_value={},
-        ), patch.object(orchestrator, "send_json_command_to_mapped_boards") as send, patch.object(
-            orchestrator, "read_and_print_responses",
+            orchestrator, "connect_boards", return_value={},
+        ), patch.object(orchestrator, "send_command") as send, patch.object(
+            orchestrator, "debug_responses", return_value=iter(()),
         ):
             orchestrator.main()
         send.assert_called_once_with({}, payload)
@@ -201,7 +233,7 @@ class ProductionTests(unittest.TestCase):
         with patch("sys.argv", ["orchestrator.py"]), patch(
             "builtins.input", side_effect=["4", "9", "quit"],
         ), patch("builtins.print"), patch.object(
-            orchestrator, "connect_to_active_boards", return_value={},
+            orchestrator, "connect_boards", return_value={},
         ), patch.object(orchestrator, "select_arm") as select:
             orchestrator.main()
         self.assertEqual([call.args for call in select.call_args_list], [({}, 4), ({}, 9)])
