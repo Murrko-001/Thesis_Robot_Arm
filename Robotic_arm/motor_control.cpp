@@ -20,7 +20,6 @@ struct MotorState {
   bool pinState = false;
 };
 
-// Positions survive commands, but reset on boot. Start all motors at the bottom.
 MotorState motorStates[NUM_MOTORS];
 
 void setMotorsEnable(bool enable) {
@@ -40,10 +39,8 @@ const char* validateCommands(JsonArray commands) {
 
   for (JsonVariant value : commands) {
     if (!value.is<JsonObject>()) return "Each command must be an object.";
+
     JsonObject command = value.as<JsonObject>();
-    if (command.containsKey("step_count") || command.containsKey("direction")) {
-      return "Use position instead of step_count and direction.";
-    }
     if (!command["position"].is<long>() || command["position"].as<long>() < 0 ||
         command["position"].as<long>() > TOP_POSITION) {
       return "Position must be an integer from 0 to 45000.";
@@ -80,7 +77,6 @@ void stepMotor(int index, unsigned long now) {
   }
 }
 
-// Move simultaneously with independent pulse timers; block until all targets are reached.
 void moveMotorsIndependently() {
   bool moving = false;
   for (int i = 0; i < NUM_MOTORS; ++i) {

@@ -3,7 +3,7 @@
 import argparse
 import json
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import serial
 
@@ -12,15 +12,16 @@ import config
 JsonPayload = Dict[str, Any]
 
 
-def validate_command(arms: Any, position: Any, delay: Any) -> None:
-    if not isinstance(arms, list) or not arms:
+def validate_command(arms: List[int], position: float, delay: int) -> None:
+    if not arms:
         raise ValueError(f"arms must contain IDs from {list(config.ARMS_MAPPING)}.")
     for arm in arms:
-        if type(arm) is not int or arm not in config.ARMS_MAPPING:
+        if arm not in config.ARMS_MAPPING:
             raise ValueError(f"arms must contain IDs from {list(config.ARMS_MAPPING)}.")
-    if type(position) not in (int, float) or not 0 <= position <= 1:
+
+    if not 0 <= position <= 1:
         raise ValueError("position must be a number from 0 to 1.")
-    if type(delay) is not int or not 1 <= delay <= 32767:
+    if not 1 <= delay <= 32767:
         raise ValueError("step_delay must be an integer from 1 to 32767 microseconds.")
 
 

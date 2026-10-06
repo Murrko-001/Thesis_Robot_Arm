@@ -5,7 +5,7 @@ void setup() {
   while (!HWSerial && millis() < 3000);
 
   configureHardware();
-  HWSerial.println("{\"status\":\"board_ready\", \"motors_active\": 3}");
+  HWSerial.println("{\"status\":\"board_ready\"}");
 }
 
 void loop() {
